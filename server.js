@@ -1,230 +1,120 @@
-// server.js
-import express from "express";
+ import express from "express";
 import fetch from "node-fetch";
 import { createClient } from "@supabase/supabase-js";
 
 const app = express();
 app.use(express.json({ limit: "20mb" }));
 
-// ================== CONFIG ==================
 const PORT = process.env.PORT || 10000;
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash";
-
-const WORKER_SECRET = process.env.OCR_WORKER_SECRET || "";
-const DEFAULT_TIMEOUT_MS = Number(process.env.OCR_TIMEOUT_MS || 60000);
-
-// ================== HELPERS ==================
-function log(...args) {
-  console.log(new Date().toISOString(), "-", ...args);
-}
-
+// ================== Security ==================
 function assertAuth(req) {
-  if (!WORKER_SECRET) return; // dev mode
-  const token = req.headers["authorization"];
-  if (!token || token !== `Bearer ${WORKER_SECRET}`) {
-    const err = new Error("Unauthorized");
-    err.status = 401;
-    throw err;
+  const secret = process.env.OCR_WORKER_SECRET;
+  if (!secret) return; // dev mode
+
+  const token = req.headers["x-worker-secret"];
+  if (token !== secret) {
+    throw new Error("Unauthorized");
   }
 }
 
+// ================== Supabase ==================
 function supabaseAdmin() {
-  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-    throw new Error("Missing Supabase env vars");
-  }
-  return createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-    auth: { persistSession: false },
-  });
+  return createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_ROLE_KEY,
+    { auth: { persistSession: false } }
+  );
 }
 
-function parseBucketPath(fullPath) {
-  let clean = fullPath.trim();
+// ================== Gemini OCR ==================
+async function runGeminiOCR(buffer, mime, lang) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  const model = process.env.GEMINI_MODEL || "gemini-2.0-flash";
 
-  // لو مخزن URL كامل بالغلط
-  if (clean.startsWith("http")) {
-    try {
-      const u = new URL(clean);
-      clean = u.pathname.replace("/storage/v1/object/public/", "");
-    } catch {}
-  }
+  const base64 = Buffer.from(buffer).toString("base64");
 
-  clean = clean.replace(/^uploads\//, "");
-  clean = clean.replace(/^docs\//, "");
-
-  const parts = clean.split("/").filter(Boolean);
-  const buckets = ["library", "library-documents", "translations"];
-
-  if (!buckets.includes(parts[0])) {
-    return { bucket: "library", path: parts.join("/") };
-  }
-
-  const [bucket, ...rest] = parts;
-  return { bucket, path: rest.join("/") };
-}
-
-async function downloadFromSupabase(filePath) {
-  const sb = supabaseAdmin();
-
-  const candidates = [
-    filePath,
-    filePath.replace(/^uploads\//, ""),
-    filePath.replace(/^uploads\/docs\//, ""),
-    `laws/${filePath.split("/").pop()}`,
-    filePath.split("/").pop(),
-  ].filter(Boolean);
-
-  for (const attempt of candidates) {
-    const { bucket, path } = parseBucketPath(attempt);
-    log("TRY DOWNLOAD:", bucket, path);
-
-    const { data, error } = await sb.storage.from(bucket).download(path);
-    if (!error && data) {
-      const buf = await data.arrayBuffer();
-      log("DOWNLOAD OK:", path, buf.byteLength, "bytes");
-      return Buffer.from(buf);
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: "user",
+            parts: [
+              {
+                text: `استخرج النص الكامل من هذا المستند بدقة عالية.
+اللغة المتوقعة: ${lang || "ar+en"}.
+أعد النص فقط بدون شرح.`,
+              },
+              {
+                inlineData: {
+                  mimeType: mime || "application/pdf",
+                  data: base64,
+                },
+              },
+            ],
+          },
+        ],
+      }),
     }
-  }
-
-  throw new Error("Supabase download failed for all attempts");
-}
-
-async function runGeminiOCR(buffer, mimeType, lang) {
-  if (!GEMINI_API_KEY) {
-    throw new Error("GEMINI_API_KEY missing");
-  }
-
-  const base64 = buffer.toString("base64");
-
-  log("OCR ENGINE: GEMINI", {
-    model: GEMINI_MODEL,
-    size: buffer.length,
-    lang,
-  });
-
-  const controller = new AbortController();
-  const timer = setTimeout(
-    () => controller.abort(),
-    DEFAULT_TIMEOUT_MS
   );
 
-  try {
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal: controller.signal,
-        body: JSON.stringify({
-          contents: [
-            {
-              role: "user",
-              parts: [
-                {
-                  text: `استخرج النص الكامل من هذا المستند بدقة عالية.
-اللغة المتوقعة: ${lang || "ar+en"}.
-أعد النص فقط بدون شرح أو تنسيق أو علامات إضافية.`,
-                },
-                {
-                  inlineData: {
-                    mimeType: mimeType || "application/pdf",
-                    data: base64,
-                  },
-                },
-              ],
-            },
-          ],
-        }),
-      }
-    );
+  const json = await res.json();
+  const text =
+    json?.candidates?.[0]?.content?.parts
+      ?.map((p) => p.text || "")
+      .join("\n") || "";
 
-    const raw = await res.text();
-    let json;
-    try {
-      json = JSON.parse(raw);
-    } catch {
-      throw new Error("Gemini invalid JSON: " + raw.slice(0, 200));
-    }
-
-    const text =
-      json?.candidates?.[0]?.content?.parts
-        ?.map((p) => p.text || "")
-        .join("\n") || "";
-
-    if (!text.trim()) {
-      throw new Error("Gemini returned empty OCR text");
-    }
-
-    return text;
-  } finally {
-    clearTimeout(timer);
+  if (!text.trim()) {
+    throw new Error("Gemini returned empty OCR text");
   }
+
+  return text;
 }
 
-// ================== ROUTES ==================
-app.get("/health", (_req, res) => {
-  res.json({
-    ok: true,
-    service: "legal-advisor-ocr-worker",
-    engine: "gemini",
-    time: new Date().toISOString(),
-  });
-});
-
-/**
- * POST /ocr
- * Headers:
- *  Authorization: Bearer OCR_WORKER_SECRET
- *
- * Body:
- * {
- *   "filePath": "library/laws/xxx.pdf",
- *   "mimetype": "application/pdf",
- *   "lang": "ar+en"
- * }
- */
-app.post("/ocr", async (req, res) => {
+// ================== OCR Route ==================
+app.post("/run", async (req, res) => {
   try {
     assertAuth(req);
 
-    const { filePath, mimetype, lang } = req.body || {};
-    if (!filePath) {
-      return res.status(400).json({ error: "filePath is required" });
+    const { bucket, path, mimetype, language } = req.body;
+
+    if (!bucket || !path) {
+      return res.status(400).json({ error: "bucket and path required" });
     }
 
-    log("OCR REQUEST:", filePath);
+    console.log("OCR RUN:", { bucket, path });
 
-    const buffer = await downloadFromSupabase(filePath);
+    const sb = supabaseAdmin();
+    const { data, error } = await sb.storage.from(bucket).download(path);
 
-    const text = await runGeminiOCR(
-      buffer,
-      mimetype || "application/pdf",
-      lang
-    );
+    if (error || !data) {
+      return res.status(404).json({ error: "File not found in Supabase" });
+    }
 
-    log("OCR DONE:", filePath, "LEN =", text.length);
+    const buffer = Buffer.from(await data.arrayBuffer());
+    const text = await runGeminiOCR(buffer, mimetype, language);
 
     return res.json({
       ok: true,
       length: text.length,
       text,
     });
-  } catch (e) {
-    const status = e.status || 500;
-    log("OCR ERROR:", e.message || e);
-    return res.status(status).json({
-      ok: false,
-      error: e.message || "OCR failed",
-    });
+  } catch (err) {
+    console.error("OCR ERROR:", err.message);
+    return res.status(401).json({ error: err.message });
   }
 });
 
-// ================== START ==================
+// ================== Health ==================
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, service: "legal-advisor-ocr-worker" });
+});
+
 app.listen(PORT, () => {
-  log("OCR Worker running on port", PORT);
+  console.log("OCR Worker running on port", PORT);
 });
 
