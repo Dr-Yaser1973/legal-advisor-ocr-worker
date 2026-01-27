@@ -1,114 +1,160 @@
-// server.js 
 import express from "express";
 import fetch from "node-fetch";
 import { createClient } from "@supabase/supabase-js";
-import { GoogleGenerativeAI } from "@google/generative-ai";
 import Tesseract from "tesseract.js";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
-const app = express();
-app.use(express.json({ limit: "20mb" }));
-
+// =======================
+// ENV
+// =======================
 const PORT = process.env.PORT || 10000;
-const SECRET = process.env.OCR_WORKER_SECRET;
+const WORKER_SECRET = (process.env.OCR_WORKER_SECRET || "").trim();
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const ENGINE = process.env.OCR_ENGINE || "hybrid";
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
+// =======================
+// Init
+// =======================
+const app = express();
+app.use(express.json({ limit: "10mb" }));
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+const genAI = GEMINI_API_KEY
+  ? new GoogleGenerativeAI(GEMINI_API_KEY)
+  : null;
 
-// ========================
-// Health
-// ========================
-app.get("/health", (req, res) => {
-  res.json({ ok: true, service: "ocr-worker" });
-});
-
-// ========================
-// Auth Middleware
-// ========================
-function requireSecret(req, res, next) {
-  const secret = req.headers["x-worker-secret"];
-  if (!SECRET || secret !== SECRET) {
-    console.log("❌ Unauthorized request");
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-  next();
+// =======================
+// Helpers
+// =======================
+function getHeader(req, name) {
+  return (
+    req.headers[name] ||
+    req.headers[name.toLowerCase()] ||
+    req.get(name)
+  );
 }
 
-// ========================
-// OCR RUN
-// ========================
-app.post("/run", requireSecret, async (req, res) => {
+function unauthorized(res, msg) {
+  console.log("UNAUTHORIZED:", msg);
+  return res.status(401).json({ ok: false, error: "Unauthorized" });
+}
+
+// =======================
+// Health
+// =======================
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    service: "ocr-worker",
+    secretLoaded: Boolean(WORKER_SECRET),
+    engine: ENGINE,
+  });
+});
+
+// =======================
+// Auth Middleware (Worker Only)
+// =======================
+app.use((req, res, next) => {
+  if (req.path === "/health") return next();
+
+  const incoming = (getHeader(req, "x-worker-secret") || "").trim();
+
+  console.log("HEADER RECEIVED:", incoming || "EMPTY");
+  console.log("SECRET LOADED:", WORKER_SECRET || "EMPTY");
+
+  if (!incoming || !WORKER_SECRET) {
+    return unauthorized(res, "missing");
+  }
+
+  if (incoming !== WORKER_SECRET) {
+    return unauthorized(res, "mismatch");
+  }
+
+  next();
+});
+
+// =======================
+// OCR Logic
+// =======================
+async function runTesseract(buffer, lang) {
+  const result = await Tesseract.recognize(buffer, lang || "ara+eng");
+  return result.data.text || "";
+}
+
+async function runGemini(text) {
+  if (!genAI) return text;
+
+  const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+  const prompt = `
+أعد صياغة النص التالي كنص قانوني منسق وواضح بدون حذف أي معلومات:
+
+${text}
+  `;
+  const res = await model.generateContent(prompt);
+  return res.response.text();
+}
+
+// =======================
+// Run Endpoint
+// =======================
+app.post("/run", async (req, res) => {
   try {
-    const { bucket, path, mimetype, language } = req.body;
+    const { bucket, path, mimetype, language } = req.body || {};
 
     if (!bucket || !path) {
-      return res.status(400).json({ error: "bucket and path required" });
+      return res.status(400).json({ ok: false, error: "bucket/path required" });
     }
 
-    console.log("📄 OCR REQUEST:", { bucket, path, mimetype, language });
-
-    // ========================
-    // Download from Supabase
-    // ========================
+    // 1) Signed URL
     const { data, error } = await supabase.storage
       .from(bucket)
-      .download(path);
+      .createSignedUrl(path, 300);
 
-    if (error || !data) {
-      console.error("❌ Supabase download error", error);
-      return res.status(404).json({ error: "File not found in storage" });
+    if (error || !data?.signedUrl) {
+      return res.status(404).json({
+        ok: false,
+        error: "File not found in Supabase",
+      });
     }
 
-    const buffer = Buffer.from(await data.arrayBuffer());
+    // 2) Download file
+    const fileRes = await fetch(data.signedUrl);
+    const buffer = Buffer.from(await fileRes.arrayBuffer());
 
-    let text = "";
-
-    // ========================
-    // Gemini First (Fast)
-    // ========================
-    try {
-      const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-
-      const prompt = `
-استخرج النص الكامل من هذا المستند PDF بدقة عالية.
-اللغة المطلوبة: ${language || "ar+en"}
-رجاءً أعد النص فقط بدون أي شرح.
-`;
-
-      const result = await model.generateContent([
-        { text: prompt },
-        {
-          inlineData: {
-            mimeType: mimetype || "application/pdf",
-            data: buffer.toString("base64"),
-          },
-        },
-      ]);
-
-      text = result.response.text();
-      console.log("⚡ Gemini OCR success");
-    } catch (geminiErr) {
-      console.log("⚠️ Gemini failed, fallback to Tesseract");
-
-      // ========================
-      // Tesseract Fallback
-      // ========================
-      const ocr = await Tesseract.recognize(buffer, "ara+eng");
-      text = ocr.data.text;
+    // 3) OCR
+    let rawText = "";
+    if (ENGINE === "tesseract" || ENGINE === "hybrid") {
+      rawText = await runTesseract(buffer, language || "ara+eng");
     }
 
-    return res.json({ ok: true, text });
-  } catch (err) {
-    console.error("🔥 OCR FAILED", err);
-    return res.status(500).json({ error: "OCR processing failed" });
+    // 4) Gemini polish
+    let finalText = rawText;
+    if (ENGINE === "gemini" || ENGINE === "hybrid") {
+      finalText = await runGemini(rawText);
+    }
+
+    return res.json({
+      ok: true,
+      engine: ENGINE,
+      pages: null,
+      text: finalText,
+    });
+  } catch (e) {
+    console.error("OCR RUN ERROR:", e);
+    return res.status(500).json({
+      ok: false,
+      error: e.message || "OCR failed",
+    });
   }
 });
-console.log("SECRET LOADED:", SECRET ? "YES" : "NO");
 
-// ========================
+// =======================
+// Start
+// =======================
 app.listen(PORT, () => {
+  console.log("SECRET LOADED:", Boolean(WORKER_SECRET));
   console.log(`OCR Worker running on port ${PORT}`);
 });
+
