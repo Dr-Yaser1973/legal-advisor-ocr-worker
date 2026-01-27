@@ -236,3 +236,9 @@ async function geminiOCR({ buffer, mimeType, lang }) {
         msg.toLowerCase().includes("too many requests") ||
         msg.toLowerCase
 
+        // --------------------------
+// Start
+// --------------------------
+app.listen(PORT, () => {
+  console.log(`✅ OCR Worker listening on :${PORT}`);
+});
