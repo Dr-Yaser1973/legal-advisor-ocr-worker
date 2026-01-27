@@ -1,160 +1,151 @@
 import express from "express";
 import fetch from "node-fetch";
 import { createClient } from "@supabase/supabase-js";
-import Tesseract from "tesseract.js";
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import Tesseract from "tesseract.js";
 
-// =======================
-// ENV
-// =======================
-const PORT = process.env.PORT || 10000;
-const WORKER_SECRET = (process.env.OCR_WORKER_SECRET || "").trim();
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const ENGINE = process.env.OCR_ENGINE || "hybrid";
-
-// =======================
-// Init
-// =======================
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+// ======================
+// ENV
+// ======================
+const PORT = process.env.PORT || 10000;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const WORKER_SECRET = process.env.OCR_WORKER_SECRET;
+
+// ======================
+console.log("SECRET LOADED:", WORKER_SECRET ? "YES" : "NO");
+
+// ======================
+// Clients
+// ======================
+const supabase = createClient(
+  SUPABASE_URL,
+  SUPABASE_SERVICE_ROLE_KEY
+);
+
 const genAI = GEMINI_API_KEY
   ? new GoogleGenerativeAI(GEMINI_API_KEY)
   : null;
 
-// =======================
+// ======================
 // Helpers
-// =======================
-function getHeader(req, name) {
-  return (
-    req.headers[name] ||
-    req.headers[name.toLowerCase()] ||
-    req.get(name)
-  );
+// ======================
+function unauthorized(res, msg = "Unauthorized") {
+  return res.status(401).json({ ok: false, error: msg });
 }
 
-function unauthorized(res, msg) {
-  console.log("UNAUTHORIZED:", msg);
-  return res.status(401).json({ ok: false, error: "Unauthorized" });
-}
-
-// =======================
-// Health
-// =======================
-app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    service: "ocr-worker",
-    secretLoaded: Boolean(WORKER_SECRET),
-    engine: ENGINE,
-  });
+// ======================
+// Routes
+// ======================
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, service: "ocr-worker" });
 });
 
-// =======================
-// Auth Middleware (Worker Only)
-// =======================
-app.use((req, res, next) => {
-  if (req.path === "/health") return next();
-
-  const incoming = (getHeader(req, "x-worker-secret") || "").trim();
-
-  console.log("HEADER RECEIVED:", incoming || "EMPTY");
-  console.log("SECRET LOADED:", WORKER_SECRET || "EMPTY");
-
-  if (!incoming || !WORKER_SECRET) {
-    return unauthorized(res, "missing");
-  }
-
-  if (incoming !== WORKER_SECRET) {
-    return unauthorized(res, "mismatch");
-  }
-
-  next();
-});
-
-// =======================
-// OCR Logic
-// =======================
-async function runTesseract(buffer, lang) {
-  const result = await Tesseract.recognize(buffer, lang || "ara+eng");
-  return result.data.text || "";
-}
-
-async function runGemini(text) {
-  if (!genAI) return text;
-
-  const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
-  const prompt = `
-أعد صياغة النص التالي كنص قانوني منسق وواضح بدون حذف أي معلومات:
-
-${text}
-  `;
-  const res = await model.generateContent(prompt);
-  return res.response.text();
-}
-
-// =======================
-// Run Endpoint
-// =======================
+// ======================
+// MAIN OCR ENDPOINT
+// ======================
 app.post("/run", async (req, res) => {
   try {
+    const incomingSecret = req.headers["x-worker-secret"];
+
+    console.log("HEADER RECEIVED:", incomingSecret || "EMPTY");
+    console.log("SECRET LOADED:", WORKER_SECRET || "MISSING");
+
+    if (!incomingSecret) {
+      console.log("UNAUTHORIZED: missing header");
+      return unauthorized(res, "Missing worker secret");
+    }
+
+    if (incomingSecret !== WORKER_SECRET) {
+      console.log("UNAUTHORIZED: invalid secret");
+      return unauthorized(res, "Invalid worker secret");
+    }
+
     const { bucket, path, mimetype, language } = req.body || {};
 
     if (!bucket || !path) {
-      return res.status(400).json({ ok: false, error: "bucket/path required" });
+      return res.status(400).json({
+        ok: false,
+        error: "bucket and path are required",
+      });
     }
 
-    // 1) Signed URL
+    console.log("OCR REQUEST:", { bucket, path, mimetype, language });
+
+    // ======================
+    // Download file from Supabase
+    // ======================
     const { data, error } = await supabase.storage
       .from(bucket)
-      .createSignedUrl(path, 300);
+      .download(path);
 
-    if (error || !data?.signedUrl) {
+    if (error || !data) {
+      console.log("SUPABASE DOWNLOAD ERROR:", error);
       return res.status(404).json({
         ok: false,
         error: "File not found in Supabase",
       });
     }
 
-    // 2) Download file
-    const fileRes = await fetch(data.signedUrl);
-    const buffer = Buffer.from(await fileRes.arrayBuffer());
+    const buffer = Buffer.from(await data.arrayBuffer());
 
-    // 3) OCR
-    let rawText = "";
-    if (ENGINE === "tesseract" || ENGINE === "hybrid") {
-      rawText = await runTesseract(buffer, language || "ara+eng");
+    let extractedText = "";
+
+    // ======================
+    // OCR ENGINE
+    // ======================
+    if (genAI) {
+      console.log("Using Gemini OCR");
+      const model = genAI.getGenerativeModel({
+        model: "gemini-2.0-flash",
+      });
+
+      const prompt = `
+Extract all readable text from this document.
+Language preference: ${language || "ar+en"}
+Return plain text only.
+`;
+
+      const result = await model.generateContent([
+        {
+          inlineData: {
+            data: buffer.toString("base64"),
+            mimeType: mimetype || "application/pdf",
+          },
+        },
+        prompt,
+      ]);
+
+      extractedText = result.response.text();
+    } else {
+      console.log("Using Tesseract OCR");
+      const result = await Tesseract.recognize(buffer, "ara+eng");
+      extractedText = result.data.text;
     }
 
-    // 4) Gemini polish
-    let finalText = rawText;
-    if (ENGINE === "gemini" || ENGINE === "hybrid") {
-      finalText = await runGemini(rawText);
-    }
-
+    // ======================
+    // DONE
+    // ======================
     return res.json({
       ok: true,
-      engine: ENGINE,
-      pages: null,
-      text: finalText,
+      engine: genAI ? "gemini" : "tesseract",
+      text: extractedText,
+      length: extractedText.length,
     });
-  } catch (e) {
-    console.error("OCR RUN ERROR:", e);
+  } catch (err) {
+    console.error("OCR WORKER ERROR:", err);
     return res.status(500).json({
       ok: false,
-      error: e.message || "OCR failed",
+      error: err?.message || "OCR failed",
     });
   }
 });
 
-// =======================
-// Start
-// =======================
+// ======================
 app.listen(PORT, () => {
-  console.log("SECRET LOADED:", Boolean(WORKER_SECRET));
-  console.log(`OCR Worker running on port ${PORT}`);
+  console.log("OCR Worker running on port", PORT);
 });
-
