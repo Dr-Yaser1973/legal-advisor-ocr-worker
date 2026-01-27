@@ -1,3 +1,4 @@
+console.log("SERVER VERSION: OCR-RUN-ENABLED");
 import express from "express";
 import fetch from "node-fetch";
 import { createClient } from "@supabase/supabase-js";
@@ -149,3 +150,4 @@ Return plain text only.
 app.listen(PORT, () => {
   console.log("OCR Worker running on port", PORT);
 });
+console.log("ROUTES REGISTERED: /health, /run");
