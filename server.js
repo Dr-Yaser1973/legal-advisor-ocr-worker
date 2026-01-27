@@ -106,6 +106,7 @@ app.post("/run", requireSecret, async (req, res) => {
     return res.status(500).json({ error: "OCR processing failed" });
   }
 });
+console.log("SECRET LOADED:", SECRET ? "YES" : "NO");
 
 // ========================
 app.listen(PORT, () => {
