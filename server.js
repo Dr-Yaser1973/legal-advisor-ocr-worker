@@ -234,9 +234,257 @@ async function geminiOCR({ buffer, mimeType, lang }) {
       const is429 =
         msg.includes("429") ||
         msg.toLowerCase().includes("too many requests") ||
-        msg.toLowerCase
+        msg.toLowerCase().includes("quota");
 
-        // --------------------------
+      if (!is429 || attempt === maxAttempts) {
+        throw e;
+      }
+
+      // Parse retryDelay like "retryDelay: '45s'" if present
+      let delayMs = 1500 * attempt;
+      const m = msg.match(/retryDelay[^0-9]*([0-9.]+)\s*s/i);
+      if (m && m[1]) {
+        delayMs = Math.ceil(Number(m[1]) * 1000);
+      } else {
+        // exponential backoff capped
+        delayMs = Math.min(15000, 1500 * 2 ** (attempt - 1));
+      }
+
+      await sleep(delayMs);
+    }
+  }
+
+  throw lastErr || new Error("Gemini OCR failed");
+}
+
+// --------------------------
+// PDF -> PNG pages for Tesseract
+// --------------------------
+async function pdfToPngBuffers(pdfBuffer, maxPages = 20, scale = 2) {
+  const doc = await pdfjsLib.getDocument({ data: pdfBuffer }).promise;
+  const total = doc.numPages;
+  const pages = Math.min(total, maxPages);
+
+  const out = [];
+  for (let i = 1; i <= pages; i++) {
+    const page = await doc.getPage(i);
+    const viewport = page.getViewport({ scale });
+    const canvas = createCanvas(viewport.width, viewport.height);
+    const ctx = canvas.getContext("2d");
+
+    await page.render({
+      canvasContext: ctx,
+      viewport,
+    }).promise;
+
+    const png = canvas.toBuffer("image/png");
+    out.push(png);
+  }
+  return { pages: out, totalPages: total, usedPages: pages };
+}
+
+// --------------------------
+// Tesseract OCR (fallback)
+// --------------------------
+async function tesseractOCR({ buffer, mimeType, path, lang }) {
+  const tessLang = guessLangPack(lang);
+
+  const worker = await Tesseract.createWorker(tessLang, 1, {
+    logger: () => {},
+  });
+
+  try {
+    let full = "";
+
+    // If PDF => render to images
+    if (isPdf(mimeType, path)) {
+      const { pages, totalPages, usedPages } = await pdfToPngBuffers(
+        buffer,
+        MAX_PDF_PAGES,
+        2
+      );
+
+      for (let i = 0; i < pages.length; i++) {
+        const r = await worker.recognize(pages[i]);
+        full += (r?.data?.text || "") + "\n";
+      }
+
+      return {
+        text: cleanText(full),
+        provider: "tesseract",
+        meta: { totalPages, usedPages },
+      };
+    }
+
+    // Otherwise treat buffer as image
+    const r = await worker.recognize(buffer);
+    return { text: cleanText(r?.data?.text || ""), provider: "tesseract" };
+  } finally {
+    await worker.terminate();
+  }
+}
+
+// --------------------------
+// Main OCR pipeline
+// --------------------------
+async function runOCRJob(job) {
+  const {
+    documentId,
+    bucket,
+    path,
+    mimeType,
+    lang = "ar",
+    // optional: if you already pass a signedUrl instead of storage path
+    signedUrl,
+  } = job || {};
+
+  if (!documentId) throw new Error("documentId is required");
+  if (!bucket && !signedUrl) throw new Error("bucket is required (or signedUrl)");
+  if (!path && !signedUrl) throw new Error("path is required (or signedUrl)");
+
+  // 1) Download file
+  let fileBuffer;
+  if (signedUrl) {
+    const resp = await fetch(signedUrl);
+    if (!resp.ok) throw new Error(`signedUrl download failed: ${resp.status}`);
+    const ab = await resp.arrayBuffer();
+    fileBuffer = Buffer.from(ab);
+  } else {
+    fileBuffer = await downloadFromSupabase(bucket, path);
+  }
+
+  // 2) Try Gemini first
+  if (GEMINI_API_KEY) {
+    try {
+      const g = await geminiOCR({
+        buffer: fileBuffer,
+        mimeType: mimeType || (isPdf(mimeType, path) ? "application/pdf" : "image/png"),
+        lang,
+      });
+
+      // if Gemini returns very small text (often a sign of failure on scanned docs)
+      if ((g.text || "").length >= 30) {
+        return { ok: true, ...g };
+      }
+      // otherwise fall through to Tesseract
+    } catch (e) {
+      // fall back
+      console.error("⚠️ Gemini failed -> fallback to Tesseract:", e?.message || e);
+    }
+  }
+
+  // 3) Fallback Tesseract
+  const t = await tesseractOCR({
+    buffer: fileBuffer,
+    mimeType,
+    path,
+    lang,
+  });
+
+  if (!t.text || t.text.length < 10) {
+    throw new Error("OCR produced empty/too-short output");
+  }
+
+  return { ok: true, ...t };
+}
+
+// --------------------------
+// Routes
+// --------------------------
+app.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    service: "ocr-worker",
+    time: new Date().toISOString(),
+    gemini: Boolean(GEMINI_API_KEY),
+    supabase: Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY),
+  });
+});
+
+/**
+ * POST /process
+ * Headers:
+ *  - x-worker-secret: OCR_WORKER_SECRET
+ *
+ * Body:
+ *  {
+ *    "documentId": 44,
+ *    "bucket": "library-documents",
+ *    "path": "translations/req-44/source.pdf",
+ *    "mimeType": "application/pdf",
+ *    "lang": "ar",
+ *    "signedUrl": "optional"
+ *  }
+ *
+ * Response:
+ *  { ok: true, text, provider, meta? }
+ */
+app.post("/process", requireSecret, async (req, res) => {
+  const rid = req._rid;
+  const started = Date.now();
+
+  try {
+    const job = req.body || {};
+    console.log(`[${rid}] ✅ job received`, {
+      documentId: job.documentId,
+      bucket: job.bucket,
+      path: job.path,
+      mimeType: job.mimeType,
+      hasSignedUrl: Boolean(job.signedUrl),
+    });
+
+    const result = await runOCRJob(job);
+
+    const ms = Date.now() - started;
+
+    // Optional callback to Next.js
+    // (This is helpful if you want worker to push results without waiting in Next)
+    const cb = await postCallback({
+      documentId: job.documentId,
+      ok: true,
+      text: result.text,
+      provider: result.provider,
+      meta: result.meta || null,
+      elapsedMs: ms,
+    });
+
+    console.log(`[${rid}] ✅ done in ${ms}ms via ${result.provider}`, {
+      textLen: result.text?.length || 0,
+      callback: cb?.ok ? "ok" : "failed/skipped",
+    });
+
+    return res.json({
+      ok: true,
+      text: result.text,
+      provider: result.provider,
+      meta: result.meta || null,
+      elapsedMs: ms,
+      callback: cb,
+    });
+  } catch (e) {
+    const ms = Date.now() - started;
+
+    const message = e?.message || String(e);
+    console.error(`[${rid}] ❌ failed in ${ms}ms`, message);
+
+    // Optional callback failure
+    await postCallback({
+      documentId: req.body?.documentId || null,
+      ok: false,
+      error: message,
+      elapsedMs: ms,
+    });
+
+    // Return error (Bad Gateway-like for upstream)
+    return res.status(502).json({
+      ok: false,
+      error: message,
+      elapsedMs: ms,
+    });
+  }
+});
+
+// --------------------------
 // Start
 // --------------------------
 app.listen(PORT, () => {
