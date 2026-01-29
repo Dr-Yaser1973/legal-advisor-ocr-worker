@@ -196,7 +196,9 @@ async function geminiOCR({ buffer, mimeType, lang }) {
   const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
 
   // Gemini accepts inlineData (base64)
-  const base64 = buffer.toString("base64");
+   const uint8 = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+const base64 = Buffer.from(uint8).toString("base64");
+
   const prompt = buildGeminiPrompt(lang);
 
   const req = {
