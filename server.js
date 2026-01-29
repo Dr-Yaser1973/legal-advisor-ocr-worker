@@ -307,7 +307,8 @@ async function tesseractOCR({ buffer, mimeType, path, lang }) {
       );
 
       for (let i = 0; i < pages.length; i++) {
-        const r = await worker.recognize(pages[i]);
+         const r = await worker.recognize(new Uint8Array(pages[i]));
+
         full += (r?.data?.text || "") + "\n";
       }
 
@@ -319,7 +320,9 @@ async function tesseractOCR({ buffer, mimeType, path, lang }) {
     }
 
     // Otherwise treat buffer as image
-    const r = await worker.recognize(buffer);
+      const r = await worker.recognize(new Uint8Array(buffer));
+
+
     return { text: cleanText(r?.data?.text || ""), provider: "tesseract" };
   } finally {
     await worker.terminate();
