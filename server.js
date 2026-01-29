@@ -286,7 +286,8 @@ async function pdfToPngBuffers(pdfBuffer, maxPages = 20, scale = 2) {
 }
 
 // --------------------------
-// Tesseract OCR (fallback)
+ // --------------------------
+// Tesseract OCR (fallback) — FIXED Uint8Array
 // --------------------------
 async function tesseractOCR({ buffer, mimeType, path, lang }) {
   const tessLang = guessLangPack(lang);
@@ -298,6 +299,9 @@ async function tesseractOCR({ buffer, mimeType, path, lang }) {
   try {
     let full = "";
 
+    // Always convert once
+    const inputBytes = new Uint8Array(buffer);
+
     // If PDF => render to images
     if (isPdf(mimeType, path)) {
       const { pages, totalPages, usedPages } = await pdfToPngBuffers(
@@ -307,8 +311,8 @@ async function tesseractOCR({ buffer, mimeType, path, lang }) {
       );
 
       for (let i = 0; i < pages.length; i++) {
-         const r = await worker.recognize(new Uint8Array(pages[i]));
-
+        const pageBytes = new Uint8Array(pages[i]);
+        const r = await worker.recognize(pageBytes);
         full += (r?.data?.text || "") + "\n";
       }
 
@@ -320,14 +324,13 @@ async function tesseractOCR({ buffer, mimeType, path, lang }) {
     }
 
     // Otherwise treat buffer as image
-      const r = await worker.recognize(new Uint8Array(buffer));
-
-
+    const r = await worker.recognize(inputBytes);
     return { text: cleanText(r?.data?.text || ""), provider: "tesseract" };
   } finally {
     await worker.terminate();
   }
 }
+
 
 // --------------------------
 // Main OCR pipeline
