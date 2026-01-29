@@ -13,7 +13,7 @@ import cors from "cors";
 import { createClient } from "@supabase/supabase-js";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import Tesseract from "tesseract.js";
-import fetch from "node-fetch";
+
 
 // PDF -> Image rendering
 import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
