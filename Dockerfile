@@ -3,7 +3,7 @@ FROM node:20-bullseye
 # =========================
 # System deps for OCR + PDF rendering
 # =========================
-RUN apt-get update && apt-get install -y \
+ RUN apt-get update && apt-get install -y \
   build-essential \
   python3 \
   pkg-config \
@@ -12,17 +12,13 @@ RUN apt-get update && apt-get install -y \
   libjpeg-dev \
   libgif-dev \
   librsvg2-dev \
-  ca-certificates \
-  \
-  # PDF → Image
-  poppler-utils \
-  \
-  # OCR
   tesseract-ocr \
   tesseract-ocr-ara \
   tesseract-ocr-eng \
-  \
+  poppler-utils \
+  ca-certificates \
   && rm -rf /var/lib/apt/lists/*
+
 
 # =========================
 # App
