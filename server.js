@@ -93,7 +93,13 @@ function pdfToPngs(pdfPath, outDir, maxPages) {
   const prefix = path.join(outDir, "page");
 
   // pdftoppm outputs: page-1.png, page-2.png ...
-  execSync(`pdftoppm -png "${pdfPath}" "${prefix}"`, { stdio: "ignore" });
+   execSync(
+  `pdftoppm -r 300 -scale-to 2000 -png "${pdfPath}" "${prefix}"`,
+  {
+    stdio: "ignore",
+  }
+);
+
 
   const images = fs
     .readdirSync(outDir)
@@ -114,9 +120,11 @@ async function runTesseractOnImages(images) {
   let fullText = "";
 
   for (const img of images) {
-    const res = await Tesseract.recognize(img, "ara+eng", {
-      // keep defaults; do not pass invalid options
-    });
+     const res = await Tesseract.recognize(img, "ara+eng", {
+  tessedit_pageseg_mode: 4, // نص متعدد الأعمدة
+  preserve_interword_spaces: "1",
+});
+
     fullText += "\n" + (res?.data?.text || "");
   }
 
