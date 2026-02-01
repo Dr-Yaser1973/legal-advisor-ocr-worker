@@ -1,35 +1,28 @@
  /**
- * Legal Advisor OCR Worker — Production (Linked)
- * ----------------------------------------------
+ * Legal Advisor OCR Worker — Production
+ * ------------------------------------
  * Flow:
  * Next.js -> POST /job
- *   headers: x-worker-secret
- *   body:
- *     {
- *       documentId: number,
- *       fileUrl: string (SIGNED URL from Supabase),
- *       callbackUrl: string
- *     }
+ * Headers:
+ *   x-worker-secret
+ * Body:
+ * {
+ *   documentId: number,
+ *   fileUrl: string,     // Signed URL
+ *   callbackUrl: string,
+ *   maxPages?: number
+ * }
  *
  * Worker:
- *  - downloads file from signed URL
- *  - PDF -> images (pdftoppm)
+ *  - Downloads PDF
+ *  - PDF -> PNG (pdftoppm)
  *  - OCR via Tesseract (ara+eng)
  *  - POST callback to Next.js
- *
- * ENV REQUIRED:
- * PORT=10000
- * OCR_WORKER_SECRET
- *
- * Docker must include:
- *  - poppler-utils
- *  - tesseract-ocr (+ ara + eng)
  */
 
 import express from "express";
 import fs from "fs";
 import path from "path";
-
 import { execSync } from "child_process";
 import Tesseract from "tesseract.js";
 import tmp from "tmp";
@@ -40,9 +33,6 @@ import tmp from "tmp";
 const PORT = Number(process.env.PORT || "10000");
 const OCR_WORKER_SECRET = process.env.OCR_WORKER_SECRET;
 
-// ===============================
-// Guards
-// ===============================
 if (!OCR_WORKER_SECRET) {
   throw new Error("OCR_WORKER_SECRET missing");
 }
@@ -91,9 +81,9 @@ async function tesseractOCR(pdfPath, maxPages = 20) {
   const tmpDir = tmp.dirSync({ unsafeCleanup: true });
   const prefix = path.join(tmpDir.name, "page");
 
-  // PDF -> PNG (Linux native)
+  // PDF -> PNG
   execSync(`pdftoppm -png "${pdfPath}" "${prefix}"`, {
-    stdio: "ignore",
+    stdio: "ignore"
   });
 
   const images = fs
@@ -106,15 +96,16 @@ async function tesseractOCR(pdfPath, maxPages = 20) {
 
   for (const img of images) {
     const res = await Tesseract.recognize(img, "ara+eng", {
-      tessedit_pageseg_mode: 6,
+      tessedit_pageseg_mode: 6
     });
     fullText += "\n" + (res?.data?.text || "");
   }
 
   tmpDir.removeCallback();
+
   return {
     pages: images.length,
-    text: normalizeArabic(fullText),
+    text: normalizeArabic(fullText)
   };
 }
 
@@ -141,11 +132,11 @@ app.post("/job", async (req, res) => {
         .json({ ok: false, error: "Invalid payload" });
     }
 
-    log("📥 JOB", { documentId });
+    log("📥 OCR JOB", { documentId });
 
     const tmpFile = tmp.fileSync({ postfix: ".pdf" }).name;
 
-    // Download from Supabase signed URL
+    // Download PDF
     await downloadFile(fileUrl, tmpFile);
 
     let ok = true;
@@ -166,11 +157,11 @@ app.post("/job", async (req, res) => {
       fs.unlinkSync(tmpFile);
     } catch {}
 
-    // Callback to Next.js
+    // Callback
     await fetch(callbackUrl, {
       method: "POST",
       headers: {
-        "Content-Type": "application/json",
+        "Content-Type": "application/json"
       },
       body: JSON.stringify({
         documentId: Number(documentId),
@@ -178,14 +169,17 @@ app.post("/job", async (req, res) => {
         engine,
         text: result.text || null,
         pages: result.pages || null,
-        isScanned: true,
-      }),
+        isScanned: true
+      })
     });
 
     res.json({ ok: true });
   } catch (e) {
     log("❌ JOB ERROR", e?.message || e);
-    res.status(500).json({ ok: false, error: e?.message || "Job failed" });
+    res.status(500).json({
+      ok: false,
+      error: e?.message || "Job failed"
+    });
   }
 });
 
@@ -193,5 +187,5 @@ app.post("/job", async (req, res) => {
 // Start
 // ===============================
 app.listen(PORT, "0.0.0.0", () => {
-  log("🚀 OCR Worker running on", PORT);
+  log("🚀 OCR Worker running on port", PORT);
 });

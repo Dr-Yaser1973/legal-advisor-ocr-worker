@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "express": "^4.19.2",
-    "tesseract.js": "^5.0.4"
+    "tesseract.js": "^5.0.4",
+    "tmp": "^0.2.1"
   }
 }
