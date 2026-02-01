@@ -1,301 +1,76 @@
- /**
- * Legal Advisor OCR Worker (Production)
- * ------------------------------------
- * Flow:
- * Next.js -> POST /job
- *  - validates secret
- *  - downloads file from Supabase
- *  - tries Gemini OCR (primary)
- *  - fallback to Tesseract (PDF -> Images -> OCR)
- *  - POST callback to Next.js
- *
- * ENV REQUIRED:
- * PORT=10000
- * SUPABASE_URL
- * SUPABASE_SERVICE_ROLE_KEY
- * OCR_WORKER_SECRET
- *
- * OPTIONAL:
- * GEMINI_API_KEY
- * OCR_CALLBACK_URL=https://your-next-app.com/api/ocr/worker/callback
- * OCR_CALLBACK_SECRET=same-or-different-secret
- * GEMINI_MODEL=gemini-1.5-flash
- * MAX_PDF_PAGES=20
- * DISABLE_GEMINI=1
- */
-
-import express from "express";
-import fetch from "node-fetch";
+ import express from "express";
 import fs from "fs";
 import path from "path";
-import tmp from "tmp";
-import { createClient } from "@supabase/supabase-js";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { execSync } from "child_process";
 import Tesseract from "tesseract.js";
-import { convert } from "pdf-poppler";
 
-// ===============================
-// ENV
-// ===============================
-const PORT = Number(process.env.PORT || "10000");
+const PORT = process.env.PORT || 10000;
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const app = express();
+app.use(express.json({ limit: "50mb" }));
 
-const OCR_WORKER_SECRET = process.env.OCR_WORKER_SECRET;
-const OCR_CALLBACK_URL = process.env.OCR_CALLBACK_URL;
-const OCR_CALLBACK_SECRET =
-  process.env.OCR_CALLBACK_SECRET || OCR_WORKER_SECRET;
-
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-1.5-flash";
-
-const MAX_PDF_PAGES = Number(process.env.MAX_PDF_PAGES || "20");
-const DISABLE_GEMINI = process.env.DISABLE_GEMINI === "1";
-
-// ===============================
-// Guards
-// ===============================
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  throw new Error("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY missing");
-}
-if (!OCR_WORKER_SECRET) {
-  throw new Error("OCR_WORKER_SECRET missing");
-}
-
-// ===============================
-// Clients
-// ===============================
-const supabase = createClient(
-  SUPABASE_URL,
-  SUPABASE_SERVICE_ROLE_KEY,
-  {
-    auth: {
-      persistSession: false,
-      autoRefreshToken: false,
-    },
-  }
-);
-
-const genAI = GEMINI_API_KEY
-  ? new GoogleGenerativeAI(GEMINI_API_KEY)
-  : null;
-
-// ===============================
-// Utils
-// ===============================
 function log(...args) {
   console.log(new Date().toISOString(), ...args);
 }
 
-function normalizeArabic(text = "") {
-  return text
-    .replace(/\u0640/g, "") // tatweel
-    .replace(/[^\u0600-\u06FF0-9\s.,\-()]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-async function sendCallback(payload) {
-  if (!OCR_CALLBACK_URL) return;
-
-  try {
-    await fetch(OCR_CALLBACK_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-callback-secret": OCR_CALLBACK_SECRET,
-      },
-      body: JSON.stringify(payload),
-    });
-    log("📡 Callback sent", payload);
-  } catch (e) {
-    log("❌ Callback failed", e?.message || e);
-  }
-}
-
-// ===============================
-// Supabase Download
-// ===============================
-async function downloadFromSupabase(bucket, filePath, outFile) {
-  const { data, error } = await supabase.storage
-    .from(bucket)
-    .download(filePath);
-
-  if (error || !data) {
-    throw new Error("Supabase download failed: " + error?.message);
-  }
-
-  const buffer = Buffer.from(await data.arrayBuffer());
-  fs.writeFileSync(outFile, buffer);
-}
-
-// ===============================
-// Gemini OCR
-// ===============================
-async function geminiOCR(base64File) {
-  if (!genAI) throw new Error("Gemini disabled (no API key)");
-
-  const model = genAI.getGenerativeModel({
-    model: GEMINI_MODEL,
-  });
-
-  const prompt = `
-أنت نظام OCR قانوني محترف.
-استخرج النص العربي والإنجليزي من المستند بدقة.
-رتّب الفقرات بشكل واضح.
-لا تضف شرحًا.
-`;
-
-  const result = await model.generateContent([
-    { text: prompt },
-    {
-      inlineData: {
-        mimeType: "application/pdf",
-        data: base64File,
-      },
-    },
-  ]);
-
-  return result.response.text();
-}
-
-// ===============================
-// PDF -> Images -> Tesseract
-// ===============================
-async function tesseractOCR(pdfPath) {
-  const stat = fs.statSync(pdfPath);
-  if (stat.size < 1024) {
-    throw new Error("PDF file too small or corrupted");
-  }
-
-  const tmpDir = tmp.dirSync({ unsafeCleanup: true });
-
-  await convert(pdfPath, {
-    format: "png",
-    out_dir: tmpDir.name,
-    out_prefix: "page",
-    page: MAX_PDF_PAGES > 0 ? `1-${MAX_PDF_PAGES}` : null,
-  });
-
-  const images = fs
-    .readdirSync(tmpDir.name)
-    .filter((f) => f.endsWith(".png"))
-    .slice(0, MAX_PDF_PAGES)
-    .map((f) => path.join(tmpDir.name, f));
-
-  let fullText = "";
-
-  for (const img of images) {
-    const res = await Tesseract.recognize(img, "ara+eng", {
-      tessedit_pageseg_mode: 6,
-    });
-    fullText += "\n" + (res?.data?.text || "");
-  }
-
-  tmpDir.removeCallback();
-  return fullText;
-}
-
-// ===============================
-// Express
-// ===============================
-const app = express();
-app.use(express.json({ limit: "50mb" }));
-
-// ===============================
+// ==========================
 // Health
-// ===============================
+// ==========================
 app.get("/health", (_req, res) => {
-  res.json({
-    ok: true,
-    gemini: Boolean(genAI && !DISABLE_GEMINI),
-    callback: Boolean(OCR_CALLBACK_URL),
-  });
+  res.json({ ok: true });
 });
 
-// ===============================
-// OCR JOB
-// ===============================
-app.post("/job", async (req, res) => {
+// ==========================
+// OCR endpoint
+// ==========================
+app.post("/ocr", async (req, res) => {
   try {
-    const secret = String(req.headers["x-worker-secret"] || "");
-    if (secret !== OCR_WORKER_SECRET) {
-      return res.status(401).json({ ok: false, error: "Unauthorized" });
+    const { filePath } = req.body;
+
+    if (!filePath || !fs.existsSync(filePath)) {
+      return res.status(400).json({ ok: false, error: "filePath not found" });
     }
 
-    const { documentId, bucket, path: filePath } = req.body || {};
+    const workDir = `/tmp/ocr-${Date.now()}`;
+    fs.mkdirSync(workDir, { recursive: true });
 
-    if (
-      !documentId ||
-      !Number.isFinite(Number(documentId)) ||
-      !bucket ||
-      !filePath
-    ) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Invalid job payload" });
-    }
+    // PDF → images (Linux native)
+    execSync(
+      `pdftoppm -png "${filePath}" "${path.join(workDir, "page")}"`,
+      { stdio: "ignore" }
+    );
 
-    log("📥 OCR JOB", { documentId, bucket, filePath });
-
-    const tmpFile = tmp.fileSync({ postfix: ".pdf" }).name;
-
-    await downloadFromSupabase(bucket, filePath, tmpFile);
+    const images = fs
+      .readdirSync(workDir)
+      .filter(f => f.endsWith(".png"))
+      .map(f => path.join(workDir, f));
 
     let text = "";
-    let engine = "NONE";
-    let ok = true;
 
-    // ===============================
-    // Try Gemini
-    // ===============================
-    try {
-      if (DISABLE_GEMINI) {
-        throw new Error("Gemini disabled by env");
-      }
-
-      log("🧠 GEMINI OCR attempt");
-      const base64 = fs.readFileSync(tmpFile).toString("base64");
-      text = await geminiOCR(base64);
-      engine = "GEMINI";
-    } catch (e) {
-      log("⚠ Gemini failed, fallback to Tesseract", e?.message || e);
-      try {
-        text = await tesseractOCR(tmpFile);
-        engine = "TESSERACT";
-      } catch (err) {
-        ok = false;
-        text = "";
-        log("❌ Tesseract failed", err?.message || err);
-      }
+    for (const img of images) {
+      const r = await Tesseract.recognize(img, "ara+eng", {
+        tessedit_pageseg_mode: 6
+      });
+      text += "\n" + r.data.text;
     }
 
-    try {
-      fs.unlinkSync(tmpFile);
-    } catch {}
+    fs.rmSync(workDir, { recursive: true, force: true });
 
-    text = normalizeArabic(text);
-
-    await sendCallback({
-      documentId: Number(documentId),
-      ok,
-      engine,
-      text,
-      pages: null,
-      isScanned: engine === "TESSERACT",
+    res.json({
+      ok: true,
+      pages: images.length,
+      text: text.trim()
     });
 
-    res.json({ ok: true });
   } catch (e) {
-    log("❌ JOB ERROR", e?.message || e);
-    res.status(500).json({ ok: false, error: e?.message || "Job failed" });
+    log("OCR ERROR", e.message);
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// ===============================
+// ==========================
 // Start
-// ===============================
+// ==========================
 app.listen(PORT, "0.0.0.0", () => {
-  log("🚀 OCR Worker running on port", PORT);
+  log("OCR SERVICE RUNNING ON", PORT);
 });

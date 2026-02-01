@@ -1,18 +1,13 @@
  {
-  "name": "legal-advisor-ocr-worker",
-  "version": "1.1.0",
+  "name": "legal-advisor-ocr-service",
+  "version": "1.0.0",
   "type": "module",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "@google/generative-ai": "^0.24.1",
-    "@supabase/supabase-js": "^2.39.0",
     "express": "^4.19.2",
-    "node-fetch": "^3.3.2",
-    "tesseract.js": "^5.0.4",
-    "pdf-poppler": "^0.2.1",
-    "tmp": "^0.2.1"
+    "tesseract.js": "^5.0.4"
   }
 }
