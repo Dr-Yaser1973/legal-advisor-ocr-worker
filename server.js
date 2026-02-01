@@ -29,7 +29,7 @@
 import express from "express";
 import fs from "fs";
 import path from "path";
-import fetch from "node-fetch";
+
 import { execSync } from "child_process";
 import Tesseract from "tesseract.js";
 import tmp from "tmp";
