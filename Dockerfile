@@ -1,14 +1,14 @@
- FROM node:20-bullseye
+FROM node:20-bullseye
 
 # =========================
-# System deps for OCR + PDF
+# System deps for OCR + PDF rendering
 # =========================
 RUN apt-get update && apt-get install -y \
+  ca-certificates \
   poppler-utils \
   tesseract-ocr \
   tesseract-ocr-ara \
   tesseract-ocr-eng \
-  ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
 # =========================
@@ -27,3 +27,4 @@ ENV PORT=10000
 EXPOSE 10000
 
 CMD ["node", "server.js"]
+ 
